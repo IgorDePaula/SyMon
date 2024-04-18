@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -8,17 +9,18 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/dhamith93/SyMon/collector/internal/config"
 	"github.com/dhamith93/SyMon/internal/alertapi"
 	"github.com/dhamith93/SyMon/internal/alerts"
 	"github.com/dhamith93/SyMon/internal/alertstatus"
 	"github.com/dhamith93/SyMon/internal/auth"
+	"github.com/dhamith93/SyMon/internal/config"
 	"github.com/dhamith93/SyMon/internal/database"
 	"github.com/dhamith93/SyMon/internal/logger"
 	"github.com/dhamith93/SyMon/internal/monitor"
@@ -30,45 +32,91 @@ import (
 	"google.golang.org/grpc/metadata"
 )
 
-func handleAlerts(alertConfigs []alerts.AlertConfig, config *config.Config, mysql *database.MySql) {
+func handleAlerts(alertConfigs []alerts.AlertConfig, config *config.Collector, mysql *database.MySql) {
 	mysql.ClearAllAlertsWithNullEnd()
 	ticker := time.NewTicker(15 * time.Second)
+	endpointTicker := time.NewTicker(time.Duration(config.EndpointCheckInterval) * time.Second)
 	quit := make(chan struct{})
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		incidentTracker := memdb.CreateDatabase("incident_tracker")
+	incidentTracker := memdb.CreateDatabase("incident_tracker")
+
+	delta := 1
+	if config.EndpointMonitoringEnabled {
+		delta = 2
+	}
+
+	wg.Add(delta)
+	logger.Log("info", "starting alert checker")
+	err := incidentTracker.Create(
+		"alert",
+		memdb.Col{Name: "server_name", Type: memdb.String},
+		memdb.Col{Name: "metric_type", Type: memdb.String},
+		memdb.Col{Name: "metric_name", Type: memdb.String},
+		memdb.Col{Name: "time", Type: memdb.String},
+		memdb.Col{Name: "status", Type: memdb.Int},
+		memdb.Col{Name: "value", Type: memdb.Float32},
+	)
+	if err != nil {
+		logger.Log("error", "memdb: "+err.Error())
+	} else {
+		go func() {
+			for {
+				select {
+				case <-ticker.C:
+					for _, alert := range alertConfigs {
+						if alert.MetricName == "endpoint" {
+							continue
+						}
+						for _, server := range alert.Servers {
+							processAlert(&alert, server, config, mysql, &incidentTracker)
+						}
+					}
+				case <-quit:
+					ticker.Stop()
+					return
+				}
+			}
+		}()
+	}
+
+	if config.EndpointMonitoringEnabled {
+		logger.Log("info", "starting endpoint monitor")
 		err := incidentTracker.Create(
-			"alert",
-			memdb.Col{Name: "server_name", Type: memdb.String},
-			memdb.Col{Name: "metric_type", Type: memdb.String},
-			memdb.Col{Name: "metric_name", Type: memdb.String},
-			memdb.Col{Name: "time", Type: memdb.String},
-			memdb.Col{Name: "status", Type: memdb.Int},
-			memdb.Col{Name: "value", Type: memdb.Float32},
+			"endpoint_monitor",
+			memdb.Col{Name: "url", Type: memdb.String},
+			memdb.Col{Name: "method", Type: memdb.String},
+			memdb.Col{Name: "expected", Type: memdb.Int},
+			memdb.Col{Name: "actual", Type: memdb.Int},
+			memdb.Col{Name: "time", Type: memdb.Int64},
+			memdb.Col{Name: "failed", Type: memdb.Bool},
+			memdb.Col{Name: "error", Type: memdb.String},
+			memdb.Col{Name: "alerted", Type: memdb.Bool},
 		)
 		if err != nil {
 			logger.Log("error", "memdb: "+err.Error())
-		}
-		for {
-			select {
-			case <-ticker.C:
-				for _, alert := range alertConfigs {
-					for _, server := range alert.Servers {
-						processAlert(&alert, server, config, mysql, &incidentTracker)
+		} else {
+			go func() {
+				for {
+					select {
+					case <-endpointTicker.C:
+						for _, alert := range alertConfigs {
+							if alert.MetricName == "endpoint" {
+								checkEndpoint(&alert, &incidentTracker, config)
+							}
+						}
+					case <-quit:
+						ticker.Stop()
+						return
 					}
 				}
-			case <-quit:
-				ticker.Stop()
-				return
-			}
+			}()
 		}
-	}()
+	}
 	wg.Wait()
 	fmt.Println("Exiting")
 }
 
-func processAlert(alert *alerts.AlertConfig, server string, config *config.Config, mysql *database.MySql, incidentTracker *memdb.Database) {
+func processAlert(alert *alerts.AlertConfig, server string, config *config.Collector, mysql *database.MySql, incidentTracker *memdb.Database) {
 	metricType := alert.MetricName
 	metricName := ""
 	if metricType == monitor.DISKS {
@@ -80,13 +128,15 @@ func processAlert(alert *alerts.AlertConfig, server string, config *config.Confi
 	alertStatus := buildAlertStatus(alert, &server, config, mysql)
 
 	// duplicate check
-	alertFromDbForStartEvent := mysql.GetAlertByStartEvent(strconv.FormatInt(alertStatus.StartEvent, 10))
-	if alertFromDbForStartEvent != nil {
-		return
+	if metricType != monitor.PING {
+		alertFromDbForStartEvent := mysql.GetAlertByStartEvent(strconv.FormatInt(alertStatus.StartEvent, 10))
+		if alertFromDbForStartEvent != nil {
+			return
+		}
 	}
 
 	// check if an active alert is present in DB
-	previousAlert := mysql.GetPreviousOpenAlert(&alertStatus)
+	previousAlert := mysql.GetPreviousOpenAlert(&alertStatus, alert.IsCustom)
 	if previousAlert != nil {
 		// if current alert status is normal, check if normal status continued for threshold period and update alert status in DB
 		if alertStatus.Type != alertstatus.Warning && alertStatus.Type != alertstatus.Critical {
@@ -171,6 +221,140 @@ func processAlert(alert *alerts.AlertConfig, server string, config *config.Confi
 	}
 }
 
+func checkEndpoint(alert *alerts.AlertConfig, incidentTracker *memdb.Database, config *config.Collector) {
+	var (
+		res *http.Response
+		err error
+	)
+	customCACertUsed := len(strings.TrimSpace(alert.CustomCACert)) > 0
+	client := &http.Client{}
+
+	if customCACertUsed {
+		caCert, err := ioutil.ReadFile(alert.CustomCACert)
+		if err != nil {
+			logger.Log("error", err.Error())
+			return
+		}
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM(caCert)
+
+		client = &http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{
+					RootCAs: caCertPool,
+				},
+			},
+		}
+	}
+
+	method := strings.ToUpper(alert.Method)
+
+	if method == alerts.ENDPOINT_METHOD_GET {
+		res, err = client.Get(alert.Endpoint)
+	}
+	if method == alerts.ENDPOINT_METHOD_POST {
+		body := []byte(alert.POSTBody)
+		bodyReader := bytes.NewReader(body)
+		res, err = client.Post(alert.Endpoint, alert.POSTContentType, bodyReader)
+	}
+
+	timeNow := time.Now().Unix()
+	failed := false
+	errMsg := ""
+
+	if err != nil {
+		logger.Log("error", err.Error())
+		errMsg = err.Error()
+		failed = true
+	}
+
+	statusCode := -1
+
+	if !failed {
+		defer res.Body.Close()
+		statusCode = res.StatusCode
+	}
+
+	existingRecord := incidentTracker.Tables["endpoint_monitor"].Where("url", "==", alert.Endpoint).And("method", "==", method).And("expected", "==", alert.ExpectedHTTPCode)
+
+	if existingRecord.RowCount > 0 {
+		diff := timeNow - existingRecord.Rows[0].Columns["time"].Int64Val
+		existingActual := existingRecord.Rows[0].Columns["actual"].IntVal
+		alerted := existingRecord.Rows[0].Columns["alerted"].BoolVal
+
+		existingRecord.Update("actual", statusCode)
+		existingRecord.Update("failed", failed)
+		existingRecord.Update("error", errMsg)
+
+		if statusCode != alert.ExpectedHTTPCode {
+			if alert.ExpectedHTTPCode != existingActual && !alerted {
+				if diff > int64(alert.TriggerIntveral) {
+					alertToSend := buildEndpointAlert(alert, statusCode, errMsg, false, timeNow)
+					sendAlert(alertToSend, config)
+					existingRecord.Update("alerted", true)
+				}
+			}
+		} else {
+			if alert.ExpectedHTTPCode != existingActual && alerted {
+				alertToSend := buildEndpointAlert(alert, statusCode, errMsg, true, timeNow)
+				sendAlert(alertToSend, config)
+				existingRecord.Update("alerted", false)
+			}
+			existingRecord.Update("time", timeNow)
+		}
+
+	} else {
+		incidentTracker.Tables["endpoint_monitor"].Insert(
+			"url, method, expected, actual, time, failed, error, alerted",
+			alert.Endpoint, method, alert.ExpectedHTTPCode, statusCode, timeNow, failed, errMsg, false,
+		)
+	}
+}
+
+func buildEndpointAlert(alert *alerts.AlertConfig, actualHTTPCode int, errMsg string, resolved bool, unixtime int64) *alertapi.Alert {
+	subject := "[Resolved] "
+	status := 0
+	if !resolved {
+		subject = "[Critical] "
+		status = 2
+	}
+	subject += "endpoint check failed on " + alert.Endpoint
+	errMsg = strings.ReplaceAll(errMsg, "\"", "'")
+	timestamp := time.Unix(unixtime, 0)
+	replacer := strings.NewReplacer(
+		"{subject}",
+		subject,
+		"{endpoint}",
+		alert.Endpoint,
+		"{metricName}",
+		alert.MetricName,
+		"{expected}",
+		strconv.Itoa(alert.ExpectedHTTPCode),
+		"{actual}",
+		strconv.Itoa(actualHTTPCode),
+		"{timestamp}",
+		timestamp.UTC().String(),
+		"{error}",
+		errMsg,
+		"{triggerInterval}",
+		strconv.Itoa(alert.TriggerIntveral),
+	)
+	content := replacer.Replace(alert.Template)
+	return &alertapi.Alert{
+		ServerName:   alert.Endpoint,
+		MetricName:   alert.MetricName,
+		Status:       int32(status),
+		Subject:      subject,
+		Content:      content,
+		Timestamp:    timestamp.UTC().String(),
+		Resolved:     resolved,
+		Pagerduty:    alert.Pagerduty,
+		Email:        alert.Email,
+		Slack:        alert.Slack,
+		SlackChannel: alert.SlackChannel,
+	}
+}
+
 func buildAlertToSend(server string, alert *alerts.AlertConfig, alertStatus alertstatus.AlertStatus) *alertapi.Alert {
 	alertToSend := buildAlert(alerts.Alert{
 		ServerName:        server,
@@ -187,7 +371,7 @@ func buildAlertToSend(server string, alert *alerts.AlertConfig, alertStatus aler
 	return alertToSend
 }
 
-func buildAlertStatus(alert *alerts.AlertConfig, server *string, config *config.Config, mysql *database.MySql) alertstatus.AlertStatus {
+func buildAlertStatus(alert *alerts.AlertConfig, server *string, config *config.Collector, mysql *database.MySql) alertstatus.AlertStatus {
 	var alertStatus alertstatus.AlertStatus
 	logName := ""
 
@@ -198,7 +382,10 @@ func buildAlertStatus(alert *alerts.AlertConfig, server *string, config *config.
 		logName = alert.Service
 	}
 
-	metricLogs := mysql.GetLogFromDBWithId(*server, alert.MetricName, logName, 0, 0)
+	metricLogs := mysql.GetLogFromDBWithId(*server, alert.MetricName, logName, 0, 0, alert.IsCustom)
+	if len(metricLogs) == 0 {
+		return alertStatus
+	}
 	logId := metricLogs[0][0]
 	alertStatus.Alert = *alert
 	alertStatus.Server = *server
@@ -273,6 +460,33 @@ func buildAlertStatus(alert *alerts.AlertConfig, server *string, config *config.
 			alertStatus.UnixTime = service.Time
 			break
 		}
+	case monitor.PING:
+		pingLog := mysql.GetLogFromDBWithId(*server, alert.MetricName, "", 0, 0, alert.IsCustom)
+		alertStatus.Type = alertstatus.Normal
+		if len(pingLog) > 0 {
+			lastPingTime, _ := strconv.Atoi(pingLog[0][1])
+			timeNow := time.Now().Unix()
+			diff := timeNow - int64(lastPingTime)
+			if diff > int64(alert.TriggerIntveral) {
+				alertStatus.Type = alertstatus.Critical
+			}
+		}
+		alertStatus.UnixTime = strconv.FormatInt(time.Now().Unix(), 10)
+	default:
+		var customMetric monitor.CustomMetric
+		err := json.Unmarshal([]byte(metricLogs[0][1]), &customMetric)
+		if err != nil {
+			logger.Log("error", err.Error())
+			return alertStatus
+		}
+		alertStatus.UnixTime = customMetric.Time
+		value, err := strconv.ParseFloat(customMetric.Value, 32)
+		if err != nil {
+			logger.Log("error", err.Error())
+			return alertStatus
+		}
+		alertStatus.Value = float32(value)
+		alertStatus.Type = getAlertType(alert, float64(alertStatus.Value))
 	}
 	logIdInt, err := strconv.ParseInt(logId, 10, 64)
 	if err != nil {
@@ -373,6 +587,8 @@ func buildAlert(alert alerts.Alert, status alertstatus.AlertStatus, sendPagerdut
 		status.Alert.Description,
 		"{value}",
 		value,
+		"{triggerInterval}",
+		strconv.Itoa(alert.TriggerIntveral),
 	)
 	content := replacer.Replace(alert.Template)
 
@@ -405,7 +621,7 @@ func buildAlert(alert alerts.Alert, status alertstatus.AlertStatus, sendPagerdut
 	return &alertToSend
 }
 
-func sendAlert(alert *alertapi.Alert, config *config.Config) {
+func sendAlert(alert *alertapi.Alert, config *config.Collector) {
 	conn, c, ctx, cancel := createClient(config)
 	if conn == nil {
 		logger.Log("error", "error creating connection")
@@ -428,7 +644,7 @@ func generateToken() string {
 	return token
 }
 
-func createClient(config *config.Config) (*grpc.ClientConn, alertapi.AlertServiceClient, context.Context, context.CancelFunc) {
+func createClient(config *config.Collector) (*grpc.ClientConn, alertapi.AlertServiceClient, context.Context, context.CancelFunc) {
 	var (
 		conn     *grpc.ClientConn
 		tlsCreds credentials.TransportCredentials
@@ -454,7 +670,7 @@ func createClient(config *config.Config) (*grpc.ClientConn, alertapi.AlertServic
 	return conn, c, ctx, cancel
 }
 
-func loadTLSCredsAsClient(config *config.Config) (credentials.TransportCredentials, error) {
+func loadTLSCredsAsClient(config *config.Collector) (credentials.TransportCredentials, error) {
 	cert, err := ioutil.ReadFile(config.AlertEndpointCACertPath)
 	if err != nil {
 		return nil, err
